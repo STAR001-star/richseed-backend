@@ -1,0 +1,5 @@
+INFO:     Started server process [85]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8011 (Press CTRL+C to quit)
+INFO:     127.0.0.1:41198 - "GET /api/admin/students HTTP/1.1" 200 OK
