@@ -98,3 +98,39 @@ class StudentEdit(BaseModel):
     name: Optional[str] = None
     class_name: Optional[str] = None
     fees_due: Optional[float] = None
+
+
+# ---------- Teacher portal ----------
+class TeacherPublicOut(BaseModel):
+    id: int
+    teacher_code: str
+    name: str
+    subject: str
+
+    class Config:
+        from_attributes = True
+
+
+class TeacherLoginCheck(BaseModel):
+    pin: str
+
+
+class CheckInRequest(BaseModel):
+    latitude: float
+    longitude: float
+
+
+class AttendanceMark(BaseModel):
+    status: str  # "Present" | "Absent"
+
+
+class ResultEntry(BaseModel):
+    student_id: int
+    subject: str
+    ca: float
+    exam: float
+
+
+class TeacherMessageReply(BaseModel):
+    body: str
+

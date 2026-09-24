@@ -371,3 +371,160 @@ def delete_student(student_id: int, db: Session = Depends(get_db)):
 @app.get("/")
 def root():
     return {"status": "Richseed API is running"}
+
+
+# =========================================================
+# TEACHER PORTAL
+# =========================================================
+
+def _grade_for(total: float) -> str:
+    if total >= 70:
+        return "A"
+    if total >= 60:
+        return "B"
+    if total >= 50:
+        return "C"
+    if total >= 45:
+        return "D"
+    if total >= 40:
+        return "E"
+    return "F"
+
+
+@app.get("/api/teacher/list", response_model=List[schemas.TeacherPublicOut])
+def teacher_public_list(db: Session = Depends(get_db)):
+    """Names only — no PINs — used to populate the 'select your name' screen."""
+    return db.query(models.Teacher).all()
+
+
+@app.post("/api/teacher/{teacher_id}/login")
+def teacher_login(teacher_id: int, payload: schemas.TeacherLoginCheck, db: Session = Depends(get_db)):
+    teacher = db.query(models.Teacher).filter(models.Teacher.id == teacher_id).first()
+    if not teacher or payload.pin != teacher.pin:
+        raise HTTPException(status_code=401, detail="Incorrect access code")
+    return {
+        "id": teacher.id,
+        "teacher_code": teacher.teacher_code,
+        "name": teacher.name,
+        "subject": teacher.subject,
+        "checked_in": teacher.checked_in,
+        "check_in_time": teacher.check_in_time,
+    }
+
+
+@app.post("/api/teacher/{teacher_id}/checkin")
+def teacher_checkin(teacher_id: int, payload: schemas.CheckInRequest, db: Session = Depends(get_db)):
+    teacher = db.query(models.Teacher).filter(models.Teacher.id == teacher_id).first()
+    if not teacher:
+        raise HTTPException(status_code=404, detail="Teacher not found")
+    geo = db.query(models.Geofence).first()
+    distance = _distance_meters(payload.latitude, payload.longitude, geo.latitude, geo.longitude)
+    if distance > geo.radius_m:
+        raise HTTPException(
+            status_code=403,
+            detail=f"You are {int(distance)}m from the school (must be within {geo.radius_m}m). Check-in blocked.",
+        )
+    teacher.checked_in = True
+    teacher.check_in_time = datetime.utcnow().strftime("%I:%M %p")
+    db.commit()
+    return {"checked_in": True, "check_in_time": teacher.check_in_time, "distance_m": int(distance)}
+
+
+@app.get("/api/teacher/{teacher_id}/students", response_model=List[schemas.StudentOut])
+def teacher_students(teacher_id: int, db: Session = Depends(get_db)):
+    return db.query(models.Student).filter(models.Student.teacher_id == teacher_id).all()
+
+
+@app.post("/api/teacher/{teacher_id}/students", response_model=schemas.StudentOut)
+def teacher_register_student(teacher_id: int, payload: schemas.StudentCreate, db: Session = Depends(get_db)):
+    teacher = db.query(models.Teacher).filter(models.Teacher.id == teacher_id).first()
+    if not teacher:
+        raise HTTPException(status_code=404, detail="Teacher not found")
+    count = db.query(models.Student).count()
+    code = f"S{count + 1:03d}"
+    student = models.Student(
+        student_code=code,
+        name=payload.name,
+        class_name=payload.class_name or "JSS 2A",
+        fees_due=payload.fees_due if payload.fees_due is not None else 67000,
+        fees_paid=0,
+        result_access="pending",
+        teacher_id=teacher_id,
+    )
+    db.add(student)
+    db.commit()
+    db.refresh(student)
+    return student
+
+
+@app.post("/api/teacher/{teacher_id}/students/{student_id}/attendance")
+def mark_student_attendance(teacher_id: int, student_id: int, payload: schemas.AttendanceMark, db: Session = Depends(get_db)):
+    student = db.query(models.Student).filter(models.Student.id == student_id, models.Student.teacher_id == teacher_id).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found in this teacher's class")
+    today = date.today().isoformat()
+    record = db.query(models.Attendance).filter(models.Attendance.student_id == student_id, models.Attendance.date == today).first()
+    now_time = datetime.utcnow().strftime("%I:%M %p")
+    is_late = datetime.utcnow().hour >= 8  # after 8am counts as late — adjust as needed
+    if record:
+        record.status = payload.status
+        record.time_in = now_time if payload.status == "Present" else None
+        record.late = is_late if payload.status == "Present" else False
+    else:
+        record = models.Attendance(
+            student_id=student_id, date=today, status=payload.status,
+            time_in=now_time if payload.status == "Present" else None,
+            late=is_late if payload.status == "Present" else False,
+        )
+        db.add(record)
+    db.commit()
+    return {"student_id": student_id, "date": today, "status": payload.status, "time_in": record.time_in, "late": record.late}
+
+
+@app.get("/api/teacher/{teacher_id}/students/{student_id}/attendance")
+def get_student_attendance(teacher_id: int, student_id: int, db: Session = Depends(get_db)):
+    records = db.query(models.Attendance).filter(models.Attendance.student_id == student_id).order_by(models.Attendance.date.desc()).all()
+    return [{"date": r.date, "status": r.status, "time_in": r.time_in, "late": r.late} for r in records]
+
+
+@app.get("/api/teacher/{teacher_id}/results/{student_id}")
+def get_student_results(teacher_id: int, student_id: int, db: Session = Depends(get_db)):
+    results = db.query(models.Result).filter(models.Result.student_id == student_id).all()
+    return [{"subject": r.subject, "ca": r.ca, "exam": r.exam, "total": r.total, "grade": r.grade} for r in results]
+
+
+@app.post("/api/teacher/{teacher_id}/results")
+def save_result(teacher_id: int, payload: schemas.ResultEntry, db: Session = Depends(get_db)):
+    total = payload.ca + payload.exam
+    grade = _grade_for(total)
+    existing = db.query(models.Result).filter(
+        models.Result.student_id == payload.student_id, models.Result.subject == payload.subject
+    ).first()
+    if existing:
+        existing.ca = payload.ca
+        existing.exam = payload.exam
+        existing.total = total
+        existing.grade = grade
+    else:
+        existing = models.Result(student_id=payload.student_id, subject=payload.subject, ca=payload.ca, exam=payload.exam, total=total, grade=grade)
+        db.add(existing)
+    db.commit()
+    return {"subject": payload.subject, "ca": payload.ca, "exam": payload.exam, "total": total, "grade": grade}
+
+
+@app.get("/api/teacher/{teacher_id}/messages")
+def teacher_messages(teacher_id: int, db: Session = Depends(get_db)):
+    msgs = db.query(models.Message).filter(models.Message.teacher_id == teacher_id).order_by(models.Message.created_at.asc()).all()
+    return [{"id": m.id, "sender": m.sender, "subject": m.subject, "body": m.body, "created_at": m.created_at.isoformat()} for m in msgs]
+
+
+@app.post("/api/teacher/{teacher_id}/messages/reply")
+def teacher_reply(teacher_id: int, payload: schemas.TeacherMessageReply, db: Session = Depends(get_db)):
+    teacher = db.query(models.Teacher).filter(models.Teacher.id == teacher_id).first()
+    if not teacher:
+        raise HTTPException(status_code=404, detail="Teacher not found")
+    msg = models.Message(teacher_id=teacher_id, sender="teacher", subject="Reply", body=payload.body)
+    db.add(msg)
+    db.commit()
+    db.refresh(msg)
+    return {"id": msg.id, "sender": msg.sender, "subject": msg.subject, "body": msg.body}
