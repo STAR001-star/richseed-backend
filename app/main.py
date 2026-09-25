@@ -78,6 +78,18 @@ def admin_login(payload: schemas.PinCheck, db: Session = Depends(get_db)):
     return {"success": True, "message": "Welcome, Admin"}
 
 
+@app.post("/api/admin/change-pin")
+def change_admin_pin(payload: schemas.PinChange, db: Session = Depends(get_db)):
+    settings = db.query(models.AdminSettings).first()
+    if payload.current_pin != settings.pin:
+        raise HTTPException(status_code=401, detail="Current PIN is incorrect")
+    if len(payload.new_pin) != 4 or not payload.new_pin.isdigit():
+        raise HTTPException(status_code=400, detail="New PIN must be exactly 4 digits")
+    settings.pin = payload.new_pin
+    db.commit()
+    return {"success": True}
+
+
 # =========================================================
 # OVERVIEW
 # =========================================================
@@ -528,3 +540,138 @@ def teacher_reply(teacher_id: int, payload: schemas.TeacherMessageReply, db: Ses
     db.commit()
     db.refresh(msg)
     return {"id": msg.id, "sender": msg.sender, "subject": msg.subject, "body": msg.body}
+
+
+# =========================================================
+# PARENT PORTAL
+# =========================================================
+import hashlib
+import secrets
+
+
+def _hash_password(password: str, salt: str) -> str:
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000).hex()
+
+
+@app.post("/api/parent/signup")
+def parent_signup(payload: schemas.ParentSignup, db: Session = Depends(get_db)):
+    existing = db.query(models.Parent).filter(models.Parent.email == payload.email).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="An account with this email already exists")
+    salt = secrets.token_hex(16)
+    parent = models.Parent(email=payload.email, salt=salt, password_hash=_hash_password(payload.password, salt))
+    db.add(parent)
+    db.commit()
+    db.refresh(parent)
+
+    linked = []
+    count = db.query(models.Student).count()
+    for name in payload.children_names:
+        name = name.strip()
+        if not name:
+            continue
+        # If a student with this exact name already exists and has no parent yet, link them.
+        existing_student = db.query(models.Student).filter(models.Student.name == name, models.Student.parent_id.is_(None)).first()
+        if existing_student:
+            existing_student.parent_id = parent.id
+            linked.append(existing_student)
+        else:
+            count += 1
+            new_student = models.Student(
+                student_code=f"S{count:03d}", name=name, class_name="JSS 2A",
+                fees_due=67000, fees_paid=0, result_access="pending", parent_id=parent.id,
+            )
+            db.add(new_student)
+            linked.append(new_student)
+    db.commit()
+    for s in linked:
+        db.refresh(s)
+
+    return {
+        "parent_id": parent.id,
+        "email": parent.email,
+        "children": [{"id": s.id, "student_code": s.student_code, "name": s.name, "class_name": s.class_name} for s in linked],
+    }
+
+
+@app.post("/api/parent/login")
+def parent_login(payload: schemas.ParentLogin, db: Session = Depends(get_db)):
+    parent = db.query(models.Parent).filter(models.Parent.email == payload.email).first()
+    if not parent or _hash_password(payload.password, parent.salt) != parent.password_hash:
+        raise HTTPException(status_code=401, detail="Incorrect email or password")
+    children = db.query(models.Student).filter(models.Student.parent_id == parent.id).all()
+    return {
+        "parent_id": parent.id,
+        "email": parent.email,
+        "children": [{"id": s.id, "student_code": s.student_code, "name": s.name, "class_name": s.class_name} for s in children],
+    }
+
+
+@app.get("/api/parent/{parent_id}/children")
+def parent_children(parent_id: int, db: Session = Depends(get_db)):
+    children = db.query(models.Student).filter(models.Student.parent_id == parent_id).all()
+    return [{"id": s.id, "student_code": s.student_code, "name": s.name, "class_name": s.class_name} for s in children]
+
+
+@app.get("/api/parent/children/{student_id}/overview")
+def child_overview(student_id: int, db: Session = Depends(get_db)):
+    s = db.query(models.Student).filter(models.Student.id == student_id).first()
+    if not s:
+        raise HTTPException(status_code=404, detail="Student not found")
+    results = db.query(models.Result).filter(models.Result.student_id == student_id).all()
+    attendance = db.query(models.Attendance).filter(models.Attendance.student_id == student_id).all()
+    avg = round(sum(r.total for r in results) / len(results)) if results else 0
+    att_rate = round(100 * sum(1 for a in attendance if a.status == "Present") / len(attendance)) if attendance else 0
+    return {
+        "name": s.name, "class_name": s.class_name,
+        "average_score": avg, "attendance_rate": att_rate,
+        "fees_due": s.fees_due, "fees_paid": s.fees_paid,
+        "recent_results": [{"subject": r.subject, "total": r.total, "grade": r.grade} for r in results],
+    }
+
+
+@app.get("/api/parent/children/{student_id}/attendance")
+def child_attendance(student_id: int, db: Session = Depends(get_db)):
+    records = db.query(models.Attendance).filter(models.Attendance.student_id == student_id).order_by(models.Attendance.date.desc()).all()
+    present = sum(1 for r in records if r.status == "Present")
+    return {
+        "present": present, "absent": len(records) - present,
+        "rate": round(100 * present / len(records)) if records else 0,
+        "records": [{"date": r.date, "status": r.status, "time_in": r.time_in} for r in records],
+    }
+
+
+@app.get("/api/parent/fees")
+def parent_fee_structure(db: Session = Depends(get_db)):
+    """Same fee structure the admin set — shared across the whole school."""
+    items = db.query(models.FeeItem).all()
+    return [{"name": f.name, "amount": f.amount} for f in items]
+
+
+@app.get("/api/parent/children/{student_id}/results")
+def child_results(student_id: int, db: Session = Depends(get_db)):
+    s = db.query(models.Student).filter(models.Student.id == student_id).first()
+    if not s:
+        raise HTTPException(status_code=404, detail="Student not found")
+    lock = db.query(models.ResultLock).first()
+    unlocked = (not lock.locked) and s.result_access == "approved"
+    if not unlocked:
+        return {"unlocked": False, "results": []}
+    results = db.query(models.Result).filter(models.Result.student_id == student_id).all()
+    return {"unlocked": True, "results": [{"subject": r.subject, "ca": r.ca, "exam": r.exam, "total": r.total, "grade": r.grade} for r in results]}
+
+
+@app.post("/api/parent/children/{student_id}/record-payment")
+def record_payment(student_id: int, payload: schemas.PaymentIn, db: Session = Depends(get_db)):
+    """
+    TEMPORARY endpoint used while we wait for the school's Paystack keys.
+    Once Paystack is connected, this will only run AFTER Paystack confirms the
+    transaction succeeded server-side — never trust a payment amount from the
+    browser alone in the final version.
+    """
+    s = db.query(models.Student).filter(models.Student.id == student_id).first()
+    if not s:
+        raise HTTPException(status_code=404, detail="Student not found")
+    s.fees_paid += payload.amount
+    db.commit()
+    return {"student_id": s.id, "fees_due": s.fees_due, "fees_paid": s.fees_paid}

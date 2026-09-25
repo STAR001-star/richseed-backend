@@ -6,6 +6,11 @@ class PinCheck(BaseModel):
     pin: str
 
 
+class PinChange(BaseModel):
+    current_pin: str
+    new_pin: str
+
+
 class TeacherCreate(BaseModel):
     name: str
     subject: str
@@ -133,4 +138,20 @@ class ResultEntry(BaseModel):
 
 class TeacherMessageReply(BaseModel):
     body: str
+
+
+# ---------- Parent portal ----------
+class ParentSignup(BaseModel):
+    email: str
+    password: str
+    children_names: List[str]
+
+
+class ParentLogin(BaseModel):
+    email: str
+    password: str
+
+
+class PaymentIn(BaseModel):
+    amount: float
 

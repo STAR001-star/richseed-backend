@@ -36,8 +36,10 @@ class Student(Base):
     result_access = Column(String, default="pending")  # pending | approved
     teacher_id = Column(Integer, ForeignKey("teachers.id"), nullable=True)
     parent_email = Column(String, nullable=True)
+    parent_id = Column(Integer, ForeignKey("parents.id"), nullable=True)
 
     teacher = relationship("Teacher", back_populates="students")
+    parent = relationship("Parent", back_populates="children")
     attendance_records = relationship("Attendance", back_populates="student")
     results = relationship("Result", back_populates="student")
 
@@ -88,6 +90,16 @@ class Geofence(Base):
     latitude = Column(Float, default=7.4341)
     longitude = Column(Float, default=3.9357)
     radius_m = Column(Integer, default=200)
+
+
+class Parent(Base):
+    __tablename__ = "parents"
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, unique=True, index=True, nullable=False)
+    password_hash = Column(String, nullable=False)
+    salt = Column(String, nullable=False)
+
+    children = relationship("Student", back_populates="parent")
 
 
 class Message(Base):
