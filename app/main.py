@@ -409,6 +409,34 @@ def teacher_public_list(db: Session = Depends(get_db)):
     return db.query(models.Teacher).all()
 
 
+@app.put("/api/teacher/{teacher_id}/class")
+def set_teacher_class(teacher_id: int, payload: schemas.TeacherClassUpdate, db: Session = Depends(get_db)):
+    teacher = db.query(models.Teacher).filter(models.Teacher.id == teacher_id).first()
+    if not teacher:
+        raise HTTPException(status_code=404, detail="Teacher not found")
+    teacher.class_name = payload.class_name
+    db.commit()
+    return {"class_name": teacher.class_name}
+
+
+@app.get("/api/teacher/{teacher_id}/subjects")
+def get_teacher_subjects(teacher_id: int, db: Session = Depends(get_db)):
+    teacher = db.query(models.Teacher).filter(models.Teacher.id == teacher_id).first()
+    if not teacher:
+        raise HTTPException(status_code=404, detail="Teacher not found")
+    return {"subjects": [s for s in teacher.subjects.split(",") if s]}
+
+
+@app.put("/api/teacher/{teacher_id}/subjects")
+def set_teacher_subjects(teacher_id: int, payload: schemas.TeacherSubjectsUpdate, db: Session = Depends(get_db)):
+    teacher = db.query(models.Teacher).filter(models.Teacher.id == teacher_id).first()
+    if not teacher:
+        raise HTTPException(status_code=404, detail="Teacher not found")
+    teacher.subjects = ",".join(s.strip() for s in payload.subjects if s.strip())
+    db.commit()
+    return {"subjects": [s for s in teacher.subjects.split(",") if s]}
+
+
 @app.post("/api/teacher/{teacher_id}/login")
 def teacher_login(teacher_id: int, payload: schemas.TeacherLoginCheck, db: Session = Depends(get_db)):
     teacher = db.query(models.Teacher).filter(models.Teacher.id == teacher_id).first()
@@ -421,6 +449,7 @@ def teacher_login(teacher_id: int, payload: schemas.TeacherLoginCheck, db: Sessi
         "subject": teacher.subject,
         "checked_in": teacher.checked_in,
         "check_in_time": teacher.check_in_time,
+        "class_name": teacher.class_name,
     }
 
 
@@ -607,6 +636,31 @@ def parent_login(payload: schemas.ParentLogin, db: Session = Depends(get_db)):
     }
 
 
+@app.post("/api/parent/reset-password")
+def parent_reset_password(payload: schemas.ParentResetPassword, db: Session = Depends(get_db)):
+    """
+    No email service is set up yet, so as a lightweight verification step we
+    require the parent to also know one of their child's Student IDs — this
+    proves they're the actual parent without needing to send an email.
+    """
+    parent = db.query(models.Parent).filter(models.Parent.email == payload.email).first()
+    if not parent:
+        raise HTTPException(status_code=404, detail="No account found with that email")
+    child = db.query(models.Student).filter(
+        models.Student.parent_id == parent.id,
+        models.Student.student_code == payload.student_code.upper()
+    ).first()
+    if not child:
+        raise HTTPException(status_code=401, detail="That Student ID doesn't match a child on this account")
+    if len(payload.new_password) < 4:
+        raise HTTPException(status_code=400, detail="New password must be at least 4 characters")
+    salt = secrets.token_hex(16)
+    parent.salt = salt
+    parent.password_hash = _hash_password(payload.new_password, salt)
+    db.commit()
+    return {"success": True}
+
+
 @app.get("/api/parent/{parent_id}/children")
 def parent_children(parent_id: int, db: Session = Depends(get_db)):
     children = db.query(models.Student).filter(models.Student.parent_id == parent_id).all()
@@ -656,7 +710,7 @@ def child_results(student_id: int, db: Session = Depends(get_db)):
     lock = db.query(models.ResultLock).first()
     unlocked = (not lock.locked) and s.result_access == "approved"
     if not unlocked:
-        return {"unlocked": False, "results": []}
+        return {"unlocked": False, "results": [], "reason": "global" if lock.locked else "student"}
     results = db.query(models.Result).filter(models.Result.student_id == student_id).all()
     return {"unlocked": True, "results": [{"subject": r.subject, "ca": r.ca, "exam": r.exam, "total": r.total, "grade": r.grade} for r in results]}
 
@@ -675,3 +729,41 @@ def record_payment(student_id: int, payload: schemas.PaymentIn, db: Session = De
     s.fees_paid += payload.amount
     db.commit()
     return {"student_id": s.id, "fees_due": s.fees_due, "fees_paid": s.fees_paid}
+
+
+# =========================================================
+# STUDENT PORTAL (public lookup by Student ID, no login)
+# =========================================================
+@app.get("/api/student/lookup/{query}")
+def student_lookup(query: str, db: Session = Depends(get_db)):
+    query = query.strip()
+    # 1) try exact Student ID match first (e.g. "S001")
+    s = db.query(models.Student).filter(models.Student.student_code == query.upper()).first()
+    # 2) else try an exact full-name match (case-insensitive)
+    if not s:
+        s = db.query(models.Student).filter(models.Student.name.ilike(query)).first()
+    # 3) else try a partial name match — if more than one student matches, ask them to pick
+    if not s:
+        matches = db.query(models.Student).filter(models.Student.name.ilike(f"%{query}%")).all()
+        if len(matches) > 1:
+            return {
+                "multiple": True,
+                "matches": [{"student_code": m.student_code, "name": m.name, "class_name": m.class_name} for m in matches],
+            }
+        if len(matches) == 1:
+            s = matches[0]
+    if not s:
+        raise HTTPException(status_code=404, detail="No student found with that ID or name")
+    lock = db.query(models.ResultLock).first()
+    unlocked = (not lock.locked) and s.result_access == "approved"
+    results = db.query(models.Result).filter(models.Result.student_id == s.id).all()
+    avg = round(sum(r.total for r in results) / len(results)) if results else 0
+    return {
+        "student_code": s.student_code,
+        "name": s.name,
+        "class_name": s.class_name,
+        "average_score": avg,
+        "unlocked": unlocked,
+        "reason": None if unlocked else ("global" if lock.locked else "student"),
+        "results": [{"subject": r.subject, "ca": r.ca, "exam": r.exam, "total": r.total, "grade": r.grade} for r in results] if unlocked else [],
+    }

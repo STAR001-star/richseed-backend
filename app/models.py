@@ -20,6 +20,8 @@ class Teacher(Base):
     pin = Column(String, nullable=False)  # 4-digit access code
     checked_in = Column(Boolean, default=False)
     check_in_time = Column(String, default="-")
+    class_name = Column(String, default="")  # e.g. "SS1", "JSS 2A" — the class this teacher handles
+    subjects = Column(String, default="Mathematics,English Language,Basic Science,Social Studies,Civic Education")
 
     students = relationship("Student", back_populates="teacher")
     messages = relationship("Message", back_populates="teacher")

@@ -152,6 +152,20 @@ class ParentLogin(BaseModel):
     password: str
 
 
+class ParentResetPassword(BaseModel):
+    email: str
+    student_code: str
+    new_password: str
+
+
+class TeacherClassUpdate(BaseModel):
+    class_name: str
+
+
+class TeacherSubjectsUpdate(BaseModel):
+    subjects: List[str]
+
+
 class PaymentIn(BaseModel):
     amount: float
 

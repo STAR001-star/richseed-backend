@@ -1,0 +1,8 @@
+INFO:     Started server process [109]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8001 (Press CTRL+C to quit)
+INFO:     127.0.0.1:59492 - "POST /api/parent/signup HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59494 - "POST /api/parent/login HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59496 - "POST /api/parent/reset-password HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59506 - "POST /api/parent/login HTTP/1.1" 200 OK
