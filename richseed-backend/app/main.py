@@ -28,6 +28,17 @@ app.add_middleware(
 )
 
 
+def _next_code_number(db, column, prefix):
+    """Next free number for codes like S001 / T001.
+    Uses the highest existing number (not the row count), so deleting a
+    student or teacher can never cause a duplicate code."""
+    nums = []
+    for (c,) in db.query(column).all():
+        if c and c.startswith(prefix) and c[len(prefix):].isdigit():
+            nums.append(int(c[len(prefix):]))
+    return (max(nums) if nums else 0) + 1
+
+
 # ---------- Startup: seed default rows so the API is usable immediately ----------
 @app.on_event("startup")
 def seed_defaults():
@@ -138,7 +149,7 @@ def enroll_teacher(payload: schemas.TeacherCreate, db: Session = Depends(get_db)
     count = db.query(models.Teacher).count()
     if count >= MAX_TEACHERS:
         raise HTTPException(status_code=400, detail=f"Maximum of {MAX_TEACHERS} teachers reached")
-    code = f"T{count + 1:03d}"
+    code = f"T{_next_code_number(db, models.Teacher.teacher_code, 'T'):03d}"
     pin = f"{random.randint(0, 9999):04d}"
     teacher = models.Teacher(teacher_code=code, name=payload.name, subject=payload.subject, pin=pin)
     db.add(teacher)
@@ -338,8 +349,7 @@ def list_students(db: Session = Depends(get_db)):
 
 @app.post("/api/admin/students", response_model=schemas.StudentOut)
 def add_student(payload: schemas.StudentCreate, db: Session = Depends(get_db)):
-    count = db.query(models.Student).count()
-    code = f"S{count + 1:03d}"
+    code = f"S{_next_code_number(db, models.Student.student_code, 'S'):03d}"
     student = models.Student(
         student_code=code,
         name=payload.name,
@@ -481,8 +491,7 @@ def teacher_register_student(teacher_id: int, payload: schemas.StudentCreate, db
     teacher = db.query(models.Teacher).filter(models.Teacher.id == teacher_id).first()
     if not teacher:
         raise HTTPException(status_code=404, detail="Teacher not found")
-    count = db.query(models.Student).count()
-    code = f"S{count + 1:03d}"
+    code = f"S{_next_code_number(db, models.Student.student_code, 'S'):03d}"
     student = models.Student(
         student_code=code,
         name=payload.name,
@@ -594,7 +603,7 @@ def parent_signup(payload: schemas.ParentSignup, db: Session = Depends(get_db)):
     db.refresh(parent)
 
     linked = []
-    count = db.query(models.Student).count()
+    next_num = _next_code_number(db, models.Student.student_code, 'S') - 1
     for name in payload.children_names:
         name = name.strip()
         if not name:
@@ -605,9 +614,9 @@ def parent_signup(payload: schemas.ParentSignup, db: Session = Depends(get_db)):
             existing_student.parent_id = parent.id
             linked.append(existing_student)
         else:
-            count += 1
+            next_num += 1
             new_student = models.Student(
-                student_code=f"S{count:03d}", name=name, class_name="JSS 2A",
+                student_code=f"S{next_num:03d}", name=name, class_name="JSS 2A",
                 fees_due=67000, fees_paid=0, result_access="pending", parent_id=parent.id,
             )
             db.add(new_student)

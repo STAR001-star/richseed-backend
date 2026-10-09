@@ -46,6 +46,33 @@ Once it works locally, put it online. Two easy free options:
 **Railway.app** works the same way — connect the repo, it detects Python
 automatically, same start command.
 
+## 2b. Add a real database (do this before real school data goes in)
+
+Render's free plan wipes its disk every time the service restarts or you
+push an update — anything saved in the default `richseed.db` file disappears
+when that happens. To make data permanent:
+
+1. Go to **neon.tech** (or **supabase.com** — either works) and create a free account.
+2. Create a new project. It gives you a **connection string** that looks like:
+   `postgresql://user:password@host/dbname?sslmode=require`
+3. Copy that whole string.
+4. On your Render service's dashboard, go to **Environment** (left sidebar).
+5. Click **Add Environment Variable**.
+   - Key: `DATABASE_URL`
+   - Value: paste the connection string from step 3
+6. Save. Render will redeploy automatically.
+
+That's it — no code changes needed. The app already checks for a
+`DATABASE_URL` environment variable and uses it if present (falling back to
+the local SQLite file only when that variable isn't set, which is normal
+when you run it on your own laptop). This has been tested against a real
+Postgres database and confirmed to survive a full server restart with no
+data loss.
+
+**Never put the connection string directly in your code or commit it to
+GitHub** — always set it as an environment variable like above, since your
+GitHub repo is public.
+
 Once deployed, your frontend calls that URL instead of `localhost`.
 
 ## 3. Connect the frontend
