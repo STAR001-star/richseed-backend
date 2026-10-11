@@ -128,3 +128,20 @@ Messages).
   teacher can only see their own class. We'll add that when we build those.
 - Switching from SQLite to PostgreSQL later only requires changing one line in
   `app/database.py` — nothing else in the code needs to change.
+
+## Payments (Paystack)
+
+Payments are confirmed by this server, never by the browser alone.
+
+1. In Render -> your service -> **Environment**, add the variable
+   `PAYSTACK_SECRET_KEY` with your Paystack **secret** key
+   (starts with `sk_test_` while testing, `sk_live_` when live).
+   Never put the secret key in the HTML file or on GitHub.
+2. In the Paystack dashboard -> Settings -> API Keys & Webhooks, set the
+   Webhook URL to `https://YOUR-RENDER-URL/api/paystack/webhook`
+   (use the Test field while testing, the Live field when live).
+3. Open `https://YOUR-RENDER-URL/api/debug/db-info` to confirm your data is
+   stored in Postgres ("PERMANENT") and not in a temporary file.
+
+Each payment is recorded once, by its unique Paystack reference, whether it
+arrives through the parent's browser, Paystack's webhook, or both.

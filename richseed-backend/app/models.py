@@ -114,3 +114,15 @@ class Message(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     teacher = relationship("Teacher", back_populates="messages")
+
+
+class Payment(Base):
+    """One row per confirmed Paystack payment. The unique reference is what
+    guarantees a payment can never be counted twice."""
+    __tablename__ = "payments"
+    id = Column(Integer, primary_key=True, index=True)
+    reference = Column(String, unique=True, index=True, nullable=False)
+    student_id = Column(Integer, ForeignKey("students.id"), nullable=False)
+    amount = Column(Float, nullable=False)  # in naira
+    source = Column(String, default="verify")  # verify | webhook
+    created_at = Column(DateTime, default=datetime.utcnow)

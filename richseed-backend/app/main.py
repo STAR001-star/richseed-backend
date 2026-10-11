@@ -1,3 +1,10 @@
+import os
+import hmac
+import json
+import hashlib
+import urllib.request
+import urllib.error
+import urllib.parse
 import random
 import io
 import csv
@@ -5,10 +12,11 @@ import math
 from datetime import datetime, date
 from typing import List
 
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from . import models, schemas
 from .database import engine, get_db, Base
@@ -395,6 +403,21 @@ def root():
     return {"status": "Richseed API is running"}
 
 
+@app.get("/api/debug/db-info")
+def db_info(db: Session = Depends(get_db)):
+    """Open this address in a browser to see where your data is really stored.
+    It shows no passwords or secrets, only whether storage is permanent."""
+    is_postgres = str(engine.url).startswith("postgresql")
+    return {
+        "storage": "PERMANENT (Postgres / Neon) - data is safe across restarts" if is_postgres
+                   else "TEMPORARY (SQLite file) - data is LOST whenever Render restarts",
+        "DATABASE_URL_found": bool(os.environ.get("DATABASE_URL")),
+        "teachers": db.query(models.Teacher).count(),
+        "students": db.query(models.Student).count(),
+        "parents": db.query(models.Parent).count(),
+    }
+
+
 # =========================================================
 # TEACHER PORTAL
 # =========================================================
@@ -724,20 +747,93 @@ def child_results(student_id: int, db: Session = Depends(get_db)):
     return {"unlocked": True, "results": [{"subject": r.subject, "ca": r.ca, "exam": r.exam, "total": r.total, "grade": r.grade} for r in results]}
 
 
-@app.post("/api/parent/children/{student_id}/record-payment")
-def record_payment(student_id: int, payload: schemas.PaymentIn, db: Session = Depends(get_db)):
-    """
-    TEMPORARY endpoint used while we wait for the school's Paystack keys.
-    Once Paystack is connected, this will only run AFTER Paystack confirms the
-    transaction succeeded server-side — never trust a payment amount from the
-    browser alone in the final version.
-    """
-    s = db.query(models.Student).filter(models.Student.id == student_id).first()
-    if not s:
+# =========================================================
+# PAYMENTS (Paystack) - the server checks every payment itself
+# =========================================================
+class PaymentVerifyIn(schemas.BaseModel):
+    reference: str
+
+
+def _paystack_verify(reference: str) -> dict:
+    """Ask Paystack directly whether this payment really happened."""
+    key = os.environ.get("PAYSTACK_SECRET_KEY")
+    if not key:
+        raise HTTPException(status_code=503, detail="Payment confirmation is not set up yet")
+    req = urllib.request.Request(
+        "https://api.paystack.co/transaction/verify/" + urllib.parse.quote(reference, safe=""),
+        headers={"Authorization": "Bearer " + key},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise HTTPException(status_code=404, detail="Paystack has no payment with that reference")
+        raise HTTPException(status_code=502, detail="Could not reach Paystack, try again in a moment")
+    except Exception:
+        raise HTTPException(status_code=502, detail="Could not reach Paystack, try again in a moment")
+
+
+def _record_payment(db: Session, reference: str, student_id: int, amount_naira: float, source: str):
+    """Save a payment exactly once. Returns (payment, newly_recorded)."""
+    existing = db.query(models.Payment).filter(models.Payment.reference == reference).first()
+    if existing:
+        return existing, False
+    student = db.query(models.Student).filter(models.Student.id == student_id).first()
+    if not student:
         raise HTTPException(status_code=404, detail="Student not found")
-    s.fees_paid += payload.amount
-    db.commit()
-    return {"student_id": s.id, "fees_due": s.fees_due, "fees_paid": s.fees_paid}
+    pay = models.Payment(reference=reference, student_id=student_id, amount=amount_naira, source=source)
+    db.add(pay)
+    student.fees_paid += amount_naira
+    try:
+        db.commit()
+    except IntegrityError:
+        # the other path (browser confirmation vs Paystack's webhook) won the race
+        db.rollback()
+        return db.query(models.Payment).filter(models.Payment.reference == reference).first(), False
+    return pay, True
+
+
+@app.post("/api/parent/children/{student_id}/verify-payment")
+def verify_payment(student_id: int, payload: PaymentVerifyIn, db: Session = Depends(get_db)):
+    body = _paystack_verify(payload.reference.strip())
+    data = body.get("data") or {}
+    if not body.get("status") or data.get("status") != "success":
+        raise HTTPException(status_code=402, detail="Payment was not successful (status: %s)" % data.get("status", "unknown"))
+    if data.get("currency") != "NGN":
+        raise HTTPException(status_code=400, detail="Unexpected currency")
+    meta = data.get("metadata")
+    meta_sid = meta.get("student_id") if isinstance(meta, dict) else None
+    if str(meta_sid) != str(student_id):
+        raise HTTPException(status_code=400, detail="This payment does not belong to this student")
+    amount = float(data["amount"]) / 100.0
+    pay, created = _record_payment(db, data["reference"], student_id, amount, "verify")
+    student = db.query(models.Student).filter(models.Student.id == student_id).first()
+    return {"recorded": created, "amount": pay.amount, "fees_due": student.fees_due, "fees_paid": student.fees_paid}
+
+
+@app.post("/api/paystack/webhook")
+async def paystack_webhook(request: Request, db: Session = Depends(get_db)):
+    """Paystack calls this itself after a payment, so a payment is still
+    recorded even if the parent closes the page or the server was asleep."""
+    key = os.environ.get("PAYSTACK_SECRET_KEY")
+    if not key:
+        raise HTTPException(status_code=503, detail="Payment confirmation is not set up yet")
+    raw = await request.body()
+    expected = hmac.new(key.encode(), raw, hashlib.sha512).hexdigest()
+    if not hmac.compare_digest(expected, request.headers.get("x-paystack-signature", "")):
+        raise HTTPException(status_code=401, detail="Bad signature")
+    event = json.loads(raw or b"{}")
+    if event.get("event") == "charge.success":
+        data = event.get("data") or {}
+        meta = data.get("metadata")
+        sid = meta.get("student_id") if isinstance(meta, dict) else None
+        if data.get("status") == "success" and data.get("currency") == "NGN" and sid is not None:
+            try:
+                _record_payment(db, data["reference"], int(sid), float(data["amount"]) / 100.0, "webhook")
+            except HTTPException:
+                pass  # unknown student etc. - still answer 200 so Paystack stops retrying
+    return {"received": True}
 
 
 # =========================================================
