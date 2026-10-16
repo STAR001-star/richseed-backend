@@ -145,3 +145,13 @@ Payments are confirmed by this server, never by the browser alone.
 
 Each payment is recorded once, by its unique Paystack reference, whether it
 arrives through the parent's browser, Paystack's webhook, or both.
+
+## Login protection (added)
+
+Every admin, teacher and parent address now needs a sign-in token. Set these in Render > Environment:
+
+- `AUTH_SECRET`  any long random text (keeps people signed in across restarts)
+- `PAYSTACK_SECRET_KEY`  your Paystack secret key
+- `ADMIN_PIN`  optional, only used the very first time the database is created (default 1234)
+- `ALLOWED_ORIGINS`  optional, your website address(es), comma separated (default allows any)
+- `SEED_DEMO=true`  optional, ONLY for a brand-new demo database. Never set this for the real school.

@@ -1,4 +1,5 @@
 import os
+import re
 import hmac
 import json
 import hashlib
@@ -18,7 +19,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
-from . import models, schemas
+from . import models, schemas, auth
 from .database import engine, get_db, Base
 
 Base.metadata.create_all(bind=engine)
@@ -29,8 +30,8 @@ app = FastAPI(title="Richseed Private School API")
 # Once deployed, replace "*" with your actual site URL for safety.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=[o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if o.strip()],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -50,14 +51,13 @@ def _next_code_number(db, column, prefix):
 # ---------- Startup: seed default rows so the API is usable immediately ----------
 @app.on_event("startup")
 def seed_defaults():
+    """Creates only what the system needs. Demo teachers/students are created ONLY
+    if SEED_DEMO=true is set AND the database is brand new, so deleting them
+    can never bring them back after a restart."""
     db = next(get_db())
-    if not db.query(models.AdminSettings).first():
-        db.add(models.AdminSettings(id=1, pin="1234"))
-    if not db.query(models.ResultLock).first():
-        db.add(models.ResultLock(id=1, locked=True))
-    if not db.query(models.Geofence).first():
-        db.add(models.Geofence(id=1, latitude=7.4341, longitude=3.9357, radius_m=200))
-    if not db.query(models.FeeItem).first():
+    first_run = not db.query(models.AdminSettings).first()
+    if first_run:
+        db.add(models.AdminSettings(id=1, pin=os.environ.get("ADMIN_PIN", "1234")))
         db.add_all([
             models.FeeItem(name="Tuition Fee", amount=45000),
             models.FeeItem(name="Development Levy", amount=8000),
@@ -65,24 +65,26 @@ def seed_defaults():
             models.FeeItem(name="Uniform", amount=6000),
             models.FeeItem(name="ICT Fee", amount=3000),
         ])
-    if not db.query(models.Teacher).first():
+    if not db.query(models.ResultLock).first():
+        db.add(models.ResultLock(id=1, locked=True))
+    if not db.query(models.Geofence).first():
+        db.add(models.Geofence(id=1, latitude=7.4341, longitude=3.9357, radius_m=200))
+    db.commit()
+    if first_run and os.environ.get("SEED_DEMO", "").lower() == "true":
         db.add_all([
             models.Teacher(teacher_code="T001", name="Mrs. Adaeze Okafor", subject="Mathematics", pin="2847"),
             models.Teacher(teacher_code="T002", name="Mr. Emeka Nwachukwu", subject="English Language", pin="3619"),
             models.Teacher(teacher_code="T003", name="Miss Fatima Bello", subject="Basic Science", pin="7134"),
         ])
         db.commit()
-    if not db.query(models.Student).first():
-        first_teacher = db.query(models.Teacher).first()
+        t1 = db.query(models.Teacher).first()
         db.add_all([
-            models.Student(student_code="S001", name="Chukwuemeka Obi", class_name="JSS 2A",
-                            fees_due=67000, fees_paid=45000, result_access="pending",
-                            teacher_id=first_teacher.id if first_teacher else None),
-            models.Student(student_code="S002", name="Amina Yusuf", class_name="JSS 2A",
-                            fees_due=67000, fees_paid=67000, result_access="approved",
-                            teacher_id=first_teacher.id if first_teacher else None),
+            models.Student(student_code="S001", name="Chukwuemeka Obi", class_name="JSS 2A", fees_due=67000,
+                           fees_paid=45000, result_access="pending", teacher_id=t1.id),
+            models.Student(student_code="S002", name="Amina Yusuf", class_name="JSS 2A", fees_due=67000,
+                           fees_paid=67000, result_access="approved", teacher_id=t1.id),
         ])
-    db.commit()
+        db.commit()
     db.close()
 
 
@@ -91,13 +93,17 @@ def seed_defaults():
 # =========================================================
 @app.post("/api/admin/login")
 def admin_login(payload: schemas.PinCheck, db: Session = Depends(get_db)):
+    key = "admin-fail"
+    auth.guard(key, 8, 600)
     settings = db.query(models.AdminSettings).first()
-    if payload.pin != settings.pin:
+    if not hmac.compare_digest(str(payload.pin), str(settings.pin)):
+        auth.record(key)
         raise HTTPException(status_code=401, detail="Incorrect PIN")
-    return {"success": True, "message": "Welcome, Admin"}
+    auth.clear(key)
+    return {"success": True, "message": "Welcome, Admin", "token": auth.make_token("admin")}
 
 
-@app.post("/api/admin/change-pin")
+@app.post("/api/admin/change-pin", dependencies=[Depends(auth.require_admin)])
 def change_admin_pin(payload: schemas.PinChange, db: Session = Depends(get_db)):
     settings = db.query(models.AdminSettings).first()
     if payload.current_pin != settings.pin:
@@ -112,7 +118,7 @@ def change_admin_pin(payload: schemas.PinChange, db: Session = Depends(get_db)):
 # =========================================================
 # OVERVIEW
 # =========================================================
-@app.get("/api/admin/overview")
+@app.get("/api/admin/overview", dependencies=[Depends(auth.require_admin)])
 def get_overview(db: Session = Depends(get_db)):
     teachers = db.query(models.Teacher).all()
     students = db.query(models.Student).all()
@@ -147,12 +153,12 @@ def get_overview(db: Session = Depends(get_db)):
 MAX_TEACHERS = 50
 
 
-@app.get("/api/admin/teachers", response_model=List[schemas.TeacherOut])
+@app.get("/api/admin/teachers", response_model=List[schemas.TeacherOut], dependencies=[Depends(auth.require_admin)])
 def list_teachers(db: Session = Depends(get_db)):
     return db.query(models.Teacher).all()
 
 
-@app.post("/api/admin/teachers", response_model=schemas.TeacherOut)
+@app.post("/api/admin/teachers", response_model=schemas.TeacherOut, dependencies=[Depends(auth.require_admin)])
 def enroll_teacher(payload: schemas.TeacherCreate, db: Session = Depends(get_db)):
     count = db.query(models.Teacher).count()
     if count >= MAX_TEACHERS:
@@ -166,7 +172,7 @@ def enroll_teacher(payload: schemas.TeacherCreate, db: Session = Depends(get_db)
     return teacher
 
 
-@app.delete("/api/admin/teachers/{teacher_id}")
+@app.delete("/api/admin/teachers/{teacher_id}", dependencies=[Depends(auth.require_admin)])
 def remove_teacher(teacher_id: int, db: Session = Depends(get_db)):
     teacher = db.query(models.Teacher).filter(models.Teacher.id == teacher_id).first()
     if not teacher:
@@ -176,7 +182,7 @@ def remove_teacher(teacher_id: int, db: Session = Depends(get_db)):
     return {"success": True}
 
 
-@app.put("/api/admin/teachers/{teacher_id}", response_model=schemas.TeacherOut)
+@app.put("/api/admin/teachers/{teacher_id}", response_model=schemas.TeacherOut, dependencies=[Depends(auth.require_admin)])
 def edit_teacher(teacher_id: int, payload: schemas.TeacherCreate, db: Session = Depends(get_db)):
     teacher = db.query(models.Teacher).filter(models.Teacher.id == teacher_id).first()
     if not teacher:
@@ -188,7 +194,7 @@ def edit_teacher(teacher_id: int, payload: schemas.TeacherCreate, db: Session = 
     return teacher
 
 
-@app.get("/api/admin/teachers/{teacher_id}/profile")
+@app.get("/api/admin/teachers/{teacher_id}/profile", dependencies=[Depends(auth.require_admin)])
 def teacher_profile(teacher_id: int, db: Session = Depends(get_db)):
     teacher = db.query(models.Teacher).filter(models.Teacher.id == teacher_id).first()
     if not teacher:
@@ -200,7 +206,7 @@ def teacher_profile(teacher_id: int, db: Session = Depends(get_db)):
     }
 
 
-@app.get("/api/admin/teachers/export.csv")
+@app.get("/api/admin/teachers/export.csv", dependencies=[Depends(auth.require_admin)])
 def export_teachers_csv(db: Session = Depends(get_db)):
     teachers = db.query(models.Teacher).all()
     buf = io.StringIO()
@@ -219,12 +225,12 @@ def export_teachers_csv(db: Session = Depends(get_db)):
 # =========================================================
 # FINANCE
 # =========================================================
-@app.get("/api/admin/fees", response_model=List[schemas.FeeItemOut])
+@app.get("/api/admin/fees", response_model=List[schemas.FeeItemOut], dependencies=[Depends(auth.require_admin)])
 def get_fee_structure(db: Session = Depends(get_db)):
     return db.query(models.FeeItem).all()
 
 
-@app.post("/api/admin/fees", response_model=schemas.FeeItemOut)
+@app.post("/api/admin/fees", response_model=schemas.FeeItemOut, dependencies=[Depends(auth.require_admin)])
 def add_fee_item(payload: schemas.FeeItemCreate, db: Session = Depends(get_db)):
     item = models.FeeItem(name=payload.name, amount=payload.amount)
     db.add(item)
@@ -233,7 +239,7 @@ def add_fee_item(payload: schemas.FeeItemCreate, db: Session = Depends(get_db)):
     return item
 
 
-@app.put("/api/admin/fees/{fee_id}", response_model=schemas.FeeItemOut)
+@app.put("/api/admin/fees/{fee_id}", response_model=schemas.FeeItemOut, dependencies=[Depends(auth.require_admin)])
 def edit_fee_item(fee_id: int, payload: schemas.FeeItemCreate, db: Session = Depends(get_db)):
     item = db.query(models.FeeItem).filter(models.FeeItem.id == fee_id).first()
     if not item:
@@ -245,7 +251,7 @@ def edit_fee_item(fee_id: int, payload: schemas.FeeItemCreate, db: Session = Dep
     return item
 
 
-@app.delete("/api/admin/fees/{fee_id}")
+@app.delete("/api/admin/fees/{fee_id}", dependencies=[Depends(auth.require_admin)])
 def delete_fee_item(fee_id: int, db: Session = Depends(get_db)):
     item = db.query(models.FeeItem).filter(models.FeeItem.id == fee_id).first()
     if not item:
@@ -255,7 +261,7 @@ def delete_fee_item(fee_id: int, db: Session = Depends(get_db)):
     return {"success": True}
 
 
-@app.get("/api/admin/payments")
+@app.get("/api/admin/payments", dependencies=[Depends(auth.require_admin)])
 def payment_status(db: Session = Depends(get_db)):
     students = db.query(models.Student).all()
     return [
@@ -274,13 +280,13 @@ def payment_status(db: Session = Depends(get_db)):
 # =========================================================
 # RESULTS ACCESS CONTROL
 # =========================================================
-@app.get("/api/admin/results/lock")
+@app.get("/api/admin/results/lock", dependencies=[Depends(auth.require_admin)])
 def get_result_lock(db: Session = Depends(get_db)):
     lock = db.query(models.ResultLock).first()
     return {"locked": lock.locked}
 
 
-@app.post("/api/admin/results/lock")
+@app.post("/api/admin/results/lock", dependencies=[Depends(auth.require_admin)])
 def set_result_lock(locked: bool, db: Session = Depends(get_db)):
     lock = db.query(models.ResultLock).first()
     lock.locked = locked
@@ -288,7 +294,7 @@ def set_result_lock(locked: bool, db: Session = Depends(get_db)):
     return {"locked": lock.locked}
 
 
-@app.post("/api/admin/students/{student_id}/result-access")
+@app.post("/api/admin/students/{student_id}/result-access", dependencies=[Depends(auth.require_admin)])
 def set_student_result_access(student_id: int, payload: schemas.ResultAccessUpdate, db: Session = Depends(get_db)):
     student = db.query(models.Student).filter(models.Student.id == student_id).first()
     if not student:
@@ -301,13 +307,13 @@ def set_student_result_access(student_id: int, payload: schemas.ResultAccessUpda
 # =========================================================
 # LOCATION / GEOFENCE
 # =========================================================
-@app.get("/api/admin/geofence")
+@app.get("/api/admin/geofence", dependencies=[Depends(auth.require_admin)])
 def get_geofence(db: Session = Depends(get_db)):
     g = db.query(models.Geofence).first()
     return {"latitude": g.latitude, "longitude": g.longitude, "radius_m": g.radius_m}
 
 
-@app.post("/api/admin/geofence")
+@app.post("/api/admin/geofence", dependencies=[Depends(auth.require_admin)])
 def set_geofence(payload: schemas.GeofenceUpdate, db: Session = Depends(get_db)):
     g = db.query(models.Geofence).first()
     g.latitude = payload.latitude
@@ -330,12 +336,12 @@ def _distance_meters(lat1, lon1, lat2, lon2):
 # =========================================================
 # MESSAGES
 # =========================================================
-@app.get("/api/admin/messages", response_model=List[schemas.MessageOut])
+@app.get("/api/admin/messages", response_model=List[schemas.MessageOut], dependencies=[Depends(auth.require_admin)])
 def list_messages(db: Session = Depends(get_db)):
     return db.query(models.Message).order_by(models.Message.created_at.desc()).all()
 
 
-@app.post("/api/admin/messages", response_model=schemas.MessageOut)
+@app.post("/api/admin/messages", response_model=schemas.MessageOut, dependencies=[Depends(auth.require_admin)])
 def send_message_to_teacher(payload: schemas.MessageCreate, db: Session = Depends(get_db)):
     teacher = db.query(models.Teacher).filter(models.Teacher.id == payload.teacher_id).first()
     if not teacher:
@@ -350,12 +356,12 @@ def send_message_to_teacher(payload: schemas.MessageCreate, db: Session = Depend
 # =========================================================
 # STUDENTS (used by finance/results/teacher endpoints above)
 # =========================================================
-@app.get("/api/admin/students", response_model=List[schemas.StudentOut])
+@app.get("/api/admin/students", response_model=List[schemas.StudentOut], dependencies=[Depends(auth.require_admin)])
 def list_students(db: Session = Depends(get_db)):
     return db.query(models.Student).all()
 
 
-@app.post("/api/admin/students", response_model=schemas.StudentOut)
+@app.post("/api/admin/students", response_model=schemas.StudentOut, dependencies=[Depends(auth.require_admin)])
 def add_student(payload: schemas.StudentCreate, db: Session = Depends(get_db)):
     code = f"S{_next_code_number(db, models.Student.student_code, 'S'):03d}"
     student = models.Student(
@@ -372,7 +378,7 @@ def add_student(payload: schemas.StudentCreate, db: Session = Depends(get_db)):
     return student
 
 
-@app.put("/api/admin/students/{student_id}", response_model=schemas.StudentOut)
+@app.put("/api/admin/students/{student_id}", response_model=schemas.StudentOut, dependencies=[Depends(auth.require_admin)])
 def edit_student(student_id: int, payload: schemas.StudentEdit, db: Session = Depends(get_db)):
     student = db.query(models.Student).filter(models.Student.id == student_id).first()
     if not student:
@@ -388,7 +394,7 @@ def edit_student(student_id: int, payload: schemas.StudentEdit, db: Session = De
     return student
 
 
-@app.delete("/api/admin/students/{student_id}")
+@app.delete("/api/admin/students/{student_id}", dependencies=[Depends(auth.require_admin)])
 def delete_student(student_id: int, db: Session = Depends(get_db)):
     student = db.query(models.Student).filter(models.Student.id == student_id).first()
     if not student:
@@ -412,9 +418,8 @@ def db_info(db: Session = Depends(get_db)):
         "storage": "PERMANENT (Postgres / Neon) - data is safe across restarts" if is_postgres
                    else "TEMPORARY (SQLite file) - data is LOST whenever Render restarts",
         "DATABASE_URL_found": bool(os.environ.get("DATABASE_URL")),
-        "teachers": db.query(models.Teacher).count(),
-        "students": db.query(models.Student).count(),
-        "parents": db.query(models.Parent).count(),
+        "AUTH_SECRET_set": auth.AUTH_SECRET_IS_SET,
+        "PAYSTACK_SECRET_KEY_set": bool(os.environ.get("PAYSTACK_SECRET_KEY")),
     }
 
 
@@ -442,7 +447,7 @@ def teacher_public_list(db: Session = Depends(get_db)):
     return db.query(models.Teacher).all()
 
 
-@app.put("/api/teacher/{teacher_id}/class")
+@app.put("/api/teacher/{teacher_id}/class", dependencies=[Depends(auth.require_teacher)])
 def set_teacher_class(teacher_id: int, payload: schemas.TeacherClassUpdate, db: Session = Depends(get_db)):
     teacher = db.query(models.Teacher).filter(models.Teacher.id == teacher_id).first()
     if not teacher:
@@ -452,7 +457,7 @@ def set_teacher_class(teacher_id: int, payload: schemas.TeacherClassUpdate, db: 
     return {"class_name": teacher.class_name}
 
 
-@app.get("/api/teacher/{teacher_id}/subjects")
+@app.get("/api/teacher/{teacher_id}/subjects", dependencies=[Depends(auth.require_teacher)])
 def get_teacher_subjects(teacher_id: int, db: Session = Depends(get_db)):
     teacher = db.query(models.Teacher).filter(models.Teacher.id == teacher_id).first()
     if not teacher:
@@ -460,7 +465,7 @@ def get_teacher_subjects(teacher_id: int, db: Session = Depends(get_db)):
     return {"subjects": [s for s in teacher.subjects.split(",") if s]}
 
 
-@app.put("/api/teacher/{teacher_id}/subjects")
+@app.put("/api/teacher/{teacher_id}/subjects", dependencies=[Depends(auth.require_teacher)])
 def set_teacher_subjects(teacher_id: int, payload: schemas.TeacherSubjectsUpdate, db: Session = Depends(get_db)):
     teacher = db.query(models.Teacher).filter(models.Teacher.id == teacher_id).first()
     if not teacher:
@@ -472,10 +477,15 @@ def set_teacher_subjects(teacher_id: int, payload: schemas.TeacherSubjectsUpdate
 
 @app.post("/api/teacher/{teacher_id}/login")
 def teacher_login(teacher_id: int, payload: schemas.TeacherLoginCheck, db: Session = Depends(get_db)):
+    key = "teacher-fail:%s" % teacher_id
+    auth.guard(key, 5, 300)
     teacher = db.query(models.Teacher).filter(models.Teacher.id == teacher_id).first()
-    if not teacher or payload.pin != teacher.pin:
+    if not teacher or not hmac.compare_digest(str(payload.pin), str(teacher.pin)):
+        auth.record(key)
         raise HTTPException(status_code=401, detail="Incorrect access code")
+    auth.clear(key)
     return {
+        "token": auth.make_token("teacher", teacher.id),
         "id": teacher.id,
         "teacher_code": teacher.teacher_code,
         "name": teacher.name,
@@ -486,7 +496,7 @@ def teacher_login(teacher_id: int, payload: schemas.TeacherLoginCheck, db: Sessi
     }
 
 
-@app.post("/api/teacher/{teacher_id}/checkin")
+@app.post("/api/teacher/{teacher_id}/checkin", dependencies=[Depends(auth.require_teacher)])
 def teacher_checkin(teacher_id: int, payload: schemas.CheckInRequest, db: Session = Depends(get_db)):
     teacher = db.query(models.Teacher).filter(models.Teacher.id == teacher_id).first()
     if not teacher:
@@ -504,12 +514,12 @@ def teacher_checkin(teacher_id: int, payload: schemas.CheckInRequest, db: Sessio
     return {"checked_in": True, "check_in_time": teacher.check_in_time, "distance_m": int(distance)}
 
 
-@app.get("/api/teacher/{teacher_id}/students", response_model=List[schemas.StudentOut])
+@app.get("/api/teacher/{teacher_id}/students", response_model=List[schemas.StudentOut], dependencies=[Depends(auth.require_teacher)])
 def teacher_students(teacher_id: int, db: Session = Depends(get_db)):
     return db.query(models.Student).filter(models.Student.teacher_id == teacher_id).all()
 
 
-@app.post("/api/teacher/{teacher_id}/students", response_model=schemas.StudentOut)
+@app.post("/api/teacher/{teacher_id}/students", response_model=schemas.StudentOut, dependencies=[Depends(auth.require_teacher)])
 def teacher_register_student(teacher_id: int, payload: schemas.StudentCreate, db: Session = Depends(get_db)):
     teacher = db.query(models.Teacher).filter(models.Teacher.id == teacher_id).first()
     if not teacher:
@@ -530,7 +540,7 @@ def teacher_register_student(teacher_id: int, payload: schemas.StudentCreate, db
     return student
 
 
-@app.post("/api/teacher/{teacher_id}/students/{student_id}/attendance")
+@app.post("/api/teacher/{teacher_id}/students/{student_id}/attendance", dependencies=[Depends(auth.require_teacher)])
 def mark_student_attendance(teacher_id: int, student_id: int, payload: schemas.AttendanceMark, db: Session = Depends(get_db)):
     student = db.query(models.Student).filter(models.Student.id == student_id, models.Student.teacher_id == teacher_id).first()
     if not student:
@@ -554,19 +564,19 @@ def mark_student_attendance(teacher_id: int, student_id: int, payload: schemas.A
     return {"student_id": student_id, "date": today, "status": payload.status, "time_in": record.time_in, "late": record.late}
 
 
-@app.get("/api/teacher/{teacher_id}/students/{student_id}/attendance")
+@app.get("/api/teacher/{teacher_id}/students/{student_id}/attendance", dependencies=[Depends(auth.require_teacher)])
 def get_student_attendance(teacher_id: int, student_id: int, db: Session = Depends(get_db)):
     records = db.query(models.Attendance).filter(models.Attendance.student_id == student_id).order_by(models.Attendance.date.desc()).all()
     return [{"date": r.date, "status": r.status, "time_in": r.time_in, "late": r.late} for r in records]
 
 
-@app.get("/api/teacher/{teacher_id}/results/{student_id}")
+@app.get("/api/teacher/{teacher_id}/results/{student_id}", dependencies=[Depends(auth.require_teacher)])
 def get_student_results(teacher_id: int, student_id: int, db: Session = Depends(get_db)):
     results = db.query(models.Result).filter(models.Result.student_id == student_id).all()
     return [{"subject": r.subject, "ca": r.ca, "exam": r.exam, "total": r.total, "grade": r.grade} for r in results]
 
 
-@app.post("/api/teacher/{teacher_id}/results")
+@app.post("/api/teacher/{teacher_id}/results", dependencies=[Depends(auth.require_teacher)])
 def save_result(teacher_id: int, payload: schemas.ResultEntry, db: Session = Depends(get_db)):
     total = payload.ca + payload.exam
     grade = _grade_for(total)
@@ -585,13 +595,13 @@ def save_result(teacher_id: int, payload: schemas.ResultEntry, db: Session = Dep
     return {"subject": payload.subject, "ca": payload.ca, "exam": payload.exam, "total": total, "grade": grade}
 
 
-@app.get("/api/teacher/{teacher_id}/messages")
+@app.get("/api/teacher/{teacher_id}/messages", dependencies=[Depends(auth.require_teacher)])
 def teacher_messages(teacher_id: int, db: Session = Depends(get_db)):
     msgs = db.query(models.Message).filter(models.Message.teacher_id == teacher_id).order_by(models.Message.created_at.asc()).all()
     return [{"id": m.id, "sender": m.sender, "subject": m.subject, "body": m.body, "created_at": m.created_at.isoformat()} for m in msgs]
 
 
-@app.post("/api/teacher/{teacher_id}/messages/reply")
+@app.post("/api/teacher/{teacher_id}/messages/reply", dependencies=[Depends(auth.require_teacher)])
 def teacher_reply(teacher_id: int, payload: schemas.TeacherMessageReply, db: Session = Depends(get_db)):
     teacher = db.query(models.Teacher).filter(models.Teacher.id == teacher_id).first()
     if not teacher:
@@ -616,6 +626,10 @@ def _hash_password(password: str, salt: str) -> str:
 
 @app.post("/api/parent/signup")
 def parent_signup(payload: schemas.ParentSignup, db: Session = Depends(get_db)):
+    if re.search(r'[<>"\'`&\\\s]', payload.email) or "@" not in payload.email or len(payload.email) > 200:
+        raise HTTPException(status_code=400, detail="Please enter a valid email address")
+    if len(payload.children_names) > 10:
+        raise HTTPException(status_code=400, detail="Too many children on one account")
     existing = db.query(models.Parent).filter(models.Parent.email == payload.email).first()
     if existing:
         raise HTTPException(status_code=400, detail="An account with this email already exists")
@@ -628,7 +642,7 @@ def parent_signup(payload: schemas.ParentSignup, db: Session = Depends(get_db)):
     linked = []
     next_num = _next_code_number(db, models.Student.student_code, 'S') - 1
     for name in payload.children_names:
-        name = name.strip()
+        name = re.sub(r'[<>"\'`&\\]', '', name).strip()[:80]
         if not name:
             continue
         # If a student with this exact name already exists and has no parent yet, link them.
@@ -649,6 +663,7 @@ def parent_signup(payload: schemas.ParentSignup, db: Session = Depends(get_db)):
         db.refresh(s)
 
     return {
+        "token": auth.make_token("parent", parent.id),
         "parent_id": parent.id,
         "email": parent.email,
         "children": [{"id": s.id, "student_code": s.student_code, "name": s.name, "class_name": s.class_name} for s in linked],
@@ -657,11 +672,16 @@ def parent_signup(payload: schemas.ParentSignup, db: Session = Depends(get_db)):
 
 @app.post("/api/parent/login")
 def parent_login(payload: schemas.ParentLogin, db: Session = Depends(get_db)):
+    key = "parent-fail:%s" % payload.email.lower()
+    auth.guard(key, 6, 300)
     parent = db.query(models.Parent).filter(models.Parent.email == payload.email).first()
-    if not parent or _hash_password(payload.password, parent.salt) != parent.password_hash:
+    if not parent or not hmac.compare_digest(_hash_password(payload.password, parent.salt), parent.password_hash):
+        auth.record(key)
         raise HTTPException(status_code=401, detail="Incorrect email or password")
+    auth.clear(key)
     children = db.query(models.Student).filter(models.Student.parent_id == parent.id).all()
     return {
+        "token": auth.make_token("parent", parent.id),
         "parent_id": parent.id,
         "email": parent.email,
         "children": [{"id": s.id, "student_code": s.student_code, "name": s.name, "class_name": s.class_name} for s in children],
@@ -675,6 +695,8 @@ def parent_reset_password(payload: schemas.ParentResetPassword, db: Session = De
     require the parent to also know one of their child's Student IDs — this
     proves they're the actual parent without needing to send an email.
     """
+    key = "reset-fail:%s" % payload.email.lower()
+    auth.guard(key, 5, 600)
     parent = db.query(models.Parent).filter(models.Parent.email == payload.email).first()
     if not parent:
         raise HTTPException(status_code=404, detail="No account found with that email")
@@ -683,6 +705,7 @@ def parent_reset_password(payload: schemas.ParentResetPassword, db: Session = De
         models.Student.student_code == payload.student_code.upper()
     ).first()
     if not child:
+        auth.record(key)
         raise HTTPException(status_code=401, detail="That Student ID doesn't match a child on this account")
     if len(payload.new_password) < 4:
         raise HTTPException(status_code=400, detail="New password must be at least 4 characters")
@@ -693,13 +716,13 @@ def parent_reset_password(payload: schemas.ParentResetPassword, db: Session = De
     return {"success": True}
 
 
-@app.get("/api/parent/{parent_id}/children")
+@app.get("/api/parent/{parent_id}/children", dependencies=[Depends(auth.require_parent_self)])
 def parent_children(parent_id: int, db: Session = Depends(get_db)):
     children = db.query(models.Student).filter(models.Student.parent_id == parent_id).all()
     return [{"id": s.id, "student_code": s.student_code, "name": s.name, "class_name": s.class_name} for s in children]
 
 
-@app.get("/api/parent/children/{student_id}/overview")
+@app.get("/api/parent/children/{student_id}/overview", dependencies=[Depends(auth.require_child_access)])
 def child_overview(student_id: int, db: Session = Depends(get_db)):
     s = db.query(models.Student).filter(models.Student.id == student_id).first()
     if not s:
@@ -716,7 +739,7 @@ def child_overview(student_id: int, db: Session = Depends(get_db)):
     }
 
 
-@app.get("/api/parent/children/{student_id}/attendance")
+@app.get("/api/parent/children/{student_id}/attendance", dependencies=[Depends(auth.require_child_access)])
 def child_attendance(student_id: int, db: Session = Depends(get_db)):
     records = db.query(models.Attendance).filter(models.Attendance.student_id == student_id).order_by(models.Attendance.date.desc()).all()
     present = sum(1 for r in records if r.status == "Present")
@@ -727,14 +750,14 @@ def child_attendance(student_id: int, db: Session = Depends(get_db)):
     }
 
 
-@app.get("/api/parent/fees")
+@app.get("/api/parent/fees", dependencies=[Depends(auth.require_parent)])
 def parent_fee_structure(db: Session = Depends(get_db)):
     """Same fee structure the admin set — shared across the whole school."""
     items = db.query(models.FeeItem).all()
     return [{"name": f.name, "amount": f.amount} for f in items]
 
 
-@app.get("/api/parent/children/{student_id}/results")
+@app.get("/api/parent/children/{student_id}/results", dependencies=[Depends(auth.require_child_access)])
 def child_results(student_id: int, db: Session = Depends(get_db)):
     s = db.query(models.Student).filter(models.Student.id == student_id).first()
     if not s:
@@ -794,7 +817,7 @@ def _record_payment(db: Session, reference: str, student_id: int, amount_naira: 
     return pay, True
 
 
-@app.post("/api/parent/children/{student_id}/verify-payment")
+@app.post("/api/parent/children/{student_id}/verify-payment", dependencies=[Depends(auth.require_child_access)])
 def verify_payment(student_id: int, payload: PaymentVerifyIn, db: Session = Depends(get_db)):
     body = _paystack_verify(payload.reference.strip())
     data = body.get("data") or {}
@@ -840,25 +863,15 @@ async def paystack_webhook(request: Request, db: Session = Depends(get_db)):
 # STUDENT PORTAL (public lookup by Student ID, no login)
 # =========================================================
 @app.get("/api/student/lookup/{query}")
-def student_lookup(query: str, db: Session = Depends(get_db)):
+def student_lookup(query: str, request: Request, db: Session = Depends(get_db)):
+    ip = "lookup:" + auth.client_ip(request)
+    auth.guard(ip, 20, 300)
+    auth.record(ip)
     query = query.strip()
-    # 1) try exact Student ID match first (e.g. "S001")
+    # Exact Student ID only (names are not searchable, so nobody can browse other children)
     s = db.query(models.Student).filter(models.Student.student_code == query.upper()).first()
-    # 2) else try an exact full-name match (case-insensitive)
     if not s:
-        s = db.query(models.Student).filter(models.Student.name.ilike(query)).first()
-    # 3) else try a partial name match — if more than one student matches, ask them to pick
-    if not s:
-        matches = db.query(models.Student).filter(models.Student.name.ilike(f"%{query}%")).all()
-        if len(matches) > 1:
-            return {
-                "multiple": True,
-                "matches": [{"student_code": m.student_code, "name": m.name, "class_name": m.class_name} for m in matches],
-            }
-        if len(matches) == 1:
-            s = matches[0]
-    if not s:
-        raise HTTPException(status_code=404, detail="No student found with that ID or name")
+        raise HTTPException(status_code=404, detail="No student found with that Student ID")
     lock = db.query(models.ResultLock).first()
     unlocked = (not lock.locked) and s.result_access == "approved"
     results = db.query(models.Result).filter(models.Result.student_id == s.id).all()
@@ -872,3 +885,67 @@ def student_lookup(query: str, db: Session = Depends(get_db)):
         "reason": None if unlocked else ("global" if lock.locked else "student"),
         "results": [{"subject": r.subject, "ca": r.ca, "exam": r.exam, "total": r.total, "grade": r.grade} for r in results] if unlocked else [],
     }
+
+
+# =========================================================
+# CONTACT + ADMISSION FORMS (public to send, admin to read)
+# =========================================================
+from pydantic import BaseModel as _BM, Field as _F
+
+
+class ContactIn(_BM):
+    name: str = _F(min_length=1, max_length=120)
+    email: str = _F(min_length=3, max_length=200)
+    subject: str = _F(default="", max_length=200)
+    message: str = _F(min_length=1, max_length=3000)
+
+
+class ApplyIn(_BM):
+    child_name: str = _F(min_length=1, max_length=120)
+    parent_name: str = _F(default="", max_length=120)
+    email: str = _F(default="", max_length=200)
+    phone: str = _F(default="", max_length=40)
+    programme: str = _F(default="", max_length=120)
+    message: str = _F(default="", max_length=3000)
+
+
+def _limit_public(request: Request):
+    key = "public-form:" + auth.client_ip(request)
+    auth.guard(key, 6, 3600)
+    auth.record(key)
+
+
+@app.post("/api/public/contact")
+def public_contact(payload: ContactIn, request: Request, db: Session = Depends(get_db)):
+    _limit_public(request)
+    db.add(models.Inquiry(kind="contact", name=payload.name.strip(), email=payload.email.strip(),
+                          subject=payload.subject.strip(), message=payload.message.strip()))
+    db.commit()
+    return {"received": True}
+
+
+@app.post("/api/public/apply")
+def public_apply(payload: ApplyIn, request: Request, db: Session = Depends(get_db)):
+    _limit_public(request)
+    db.add(models.Inquiry(kind="application", name=payload.parent_name.strip(), email=payload.email.strip(),
+                          phone=payload.phone.strip(), subject=payload.programme.strip(),
+                          message=payload.message.strip(), extra=payload.child_name.strip()))
+    db.commit()
+    return {"received": True}
+
+
+@app.get("/api/admin/inbox", dependencies=[Depends(auth.require_admin)])
+def admin_inbox(db: Session = Depends(get_db)):
+    rows = db.query(models.Inquiry).order_by(models.Inquiry.id.desc()).limit(200).all()
+    return [{"id": r.id, "kind": r.kind, "name": r.name, "email": r.email, "phone": r.phone,
+             "subject": r.subject, "message": r.message, "child": r.extra,
+             "created": r.created_at.strftime("%Y-%m-%d %H:%M") if r.created_at else ""} for r in rows]
+
+
+@app.delete("/api/admin/inbox/{item_id}", dependencies=[Depends(auth.require_admin)])
+def admin_inbox_delete(item_id: int, db: Session = Depends(get_db)):
+    r = db.query(models.Inquiry).filter(models.Inquiry.id == item_id).first()
+    if r:
+        db.delete(r)
+        db.commit()
+    return {"success": True}

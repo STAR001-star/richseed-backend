@@ -126,3 +126,17 @@ class Payment(Base):
     amount = Column(Float, nullable=False)  # in naira
     source = Column(String, default="verify")  # verify | webhook
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Inquiry(Base):
+    """Messages from the Contact form and applications from the Admission form."""
+    __tablename__ = "inquiries"
+    id = Column(Integer, primary_key=True, index=True)
+    kind = Column(String, nullable=False)  # contact | application
+    name = Column(String, default="")
+    email = Column(String, default="")
+    phone = Column(String, default="")
+    subject = Column(String, default="")  # contact: subject / application: class applying for
+    message = Column(String, default="")
+    extra = Column(String, default="")  # application: child's name
+    created_at = Column(DateTime, default=datetime.utcnow)
