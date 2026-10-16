@@ -70,6 +70,10 @@ def seed_defaults():
     if not db.query(models.Geofence).first():
         db.add(models.Geofence(id=1, latitude=7.4341, longitude=3.9357, radius_m=200))
     db.commit()
+    total = _fee_total(db)
+    if total != 67000:
+        db.query(models.Student).filter(models.Student.fees_due == 67000).update({models.Student.fees_due: total})
+        db.commit()
     if first_run and os.environ.get("SEED_DEMO", "").lower() == "true":
         db.add_all([
             models.Teacher(teacher_code="T001", name="Mrs. Adaeze Okafor", subject="Mathematics", pin="2847"),
@@ -225,6 +229,17 @@ def export_teachers_csv(db: Session = Depends(get_db)):
 # =========================================================
 # FINANCE
 # =========================================================
+def _fee_total(db: Session) -> float:
+    items = db.query(models.FeeItem).all()
+    return float(sum(f.amount for f in items)) if items else 67000.0
+
+
+def _sync_fees(db: Session):
+    """Keep every student's total fees equal to the school's fee list."""
+    db.query(models.Student).update({models.Student.fees_due: _fee_total(db)})
+    db.commit()
+
+
 @app.get("/api/admin/fees", response_model=List[schemas.FeeItemOut], dependencies=[Depends(auth.require_admin)])
 def get_fee_structure(db: Session = Depends(get_db)):
     return db.query(models.FeeItem).all()
@@ -235,6 +250,7 @@ def add_fee_item(payload: schemas.FeeItemCreate, db: Session = Depends(get_db)):
     item = models.FeeItem(name=payload.name, amount=payload.amount)
     db.add(item)
     db.commit()
+    _sync_fees(db)
     db.refresh(item)
     return item
 
@@ -247,6 +263,7 @@ def edit_fee_item(fee_id: int, payload: schemas.FeeItemCreate, db: Session = Dep
     item.name = payload.name
     item.amount = payload.amount
     db.commit()
+    _sync_fees(db)
     db.refresh(item)
     return item
 
@@ -258,6 +275,7 @@ def delete_fee_item(fee_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Fee item not found")
     db.delete(item)
     db.commit()
+    _sync_fees(db)
     return {"success": True}
 
 
@@ -368,7 +386,7 @@ def add_student(payload: schemas.StudentCreate, db: Session = Depends(get_db)):
         student_code=code,
         name=payload.name,
         class_name=payload.class_name or "JSS 2A",
-        fees_due=payload.fees_due if payload.fees_due is not None else 67000,
+        fees_due=payload.fees_due if payload.fees_due is not None else _fee_total(db),
         fees_paid=0,
         result_access="pending",
     )
@@ -529,7 +547,7 @@ def teacher_register_student(teacher_id: int, payload: schemas.StudentCreate, db
         student_code=code,
         name=payload.name,
         class_name=payload.class_name or "JSS 2A",
-        fees_due=payload.fees_due if payload.fees_due is not None else 67000,
+        fees_due=payload.fees_due if payload.fees_due is not None else _fee_total(db),
         fees_paid=0,
         result_access="pending",
         teacher_id=teacher_id,
@@ -654,7 +672,7 @@ def parent_signup(payload: schemas.ParentSignup, db: Session = Depends(get_db)):
             next_num += 1
             new_student = models.Student(
                 student_code=f"S{next_num:03d}", name=name, class_name="JSS 2A",
-                fees_due=67000, fees_paid=0, result_access="pending", parent_id=parent.id,
+                fees_due=_fee_total(db), fees_paid=0, result_access="pending", parent_id=parent.id,
             )
             db.add(new_student)
             linked.append(new_student)
@@ -784,7 +802,7 @@ def _paystack_verify(reference: str) -> dict:
         raise HTTPException(status_code=503, detail="Payment confirmation is not set up yet")
     req = urllib.request.Request(
         "https://api.paystack.co/transaction/verify/" + urllib.parse.quote(reference, safe=""),
-        headers={"Authorization": "Bearer " + key},
+        headers={"Authorization": "Bearer " + key, "User-Agent": "RichseedSchool/1.0", "Accept": "application/json"},
     )
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
@@ -792,8 +810,13 @@ def _paystack_verify(reference: str) -> dict:
     except urllib.error.HTTPError as e:
         if e.code == 404:
             raise HTTPException(status_code=404, detail="Paystack has no payment with that reference")
+        try:
+            print("PAYSTACK VERIFY ERROR", e.code, e.read()[:300])
+        except Exception:
+            print("PAYSTACK VERIFY ERROR", e.code)
         raise HTTPException(status_code=502, detail="Could not reach Paystack, try again in a moment")
-    except Exception:
+    except Exception as e:
+        print("PAYSTACK VERIFY EXCEPTION", repr(e))
         raise HTTPException(status_code=502, detail="Could not reach Paystack, try again in a moment")
 
 

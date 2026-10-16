@@ -96,7 +96,7 @@ class PaymentRecord(BaseModel):
 class StudentCreate(BaseModel):
     name: str
     class_name: Optional[str] = "JSS 2A"
-    fees_due: Optional[float] = 67000
+    fees_due: Optional[float] = None
 
 
 class StudentEdit(BaseModel):
