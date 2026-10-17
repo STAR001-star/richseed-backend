@@ -417,6 +417,11 @@ def delete_student(student_id: int, db: Session = Depends(get_db)):
     student = db.query(models.Student).filter(models.Student.id == student_id).first()
     if not student:
         raise HTTPException(status_code=404, detail="Student not found")
+    # Remove everything that belongs to this student first, otherwise the database
+    # refuses the delete (payments are linked to the student).
+    db.query(models.Payment).filter(models.Payment.student_id == student_id).delete(synchronize_session=False)
+    db.query(models.Attendance).filter(models.Attendance.student_id == student_id).delete(synchronize_session=False)
+    db.query(models.Result).filter(models.Result.student_id == student_id).delete(synchronize_session=False)
     db.delete(student)
     db.commit()
     return {"success": True}
