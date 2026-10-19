@@ -95,7 +95,7 @@ class PaymentRecord(BaseModel):
 
 class StudentCreate(BaseModel):
     name: str
-    class_name: Optional[str] = "JSS 2A"
+    class_name: Optional[str] = None
     fees_due: Optional[float] = None
 
 
@@ -141,10 +141,16 @@ class TeacherMessageReply(BaseModel):
 
 
 # ---------- Parent portal ----------
+class ChildSignup(BaseModel):
+    name: str
+    class_name: Optional[str] = None
+
+
 class ParentSignup(BaseModel):
     email: str
     password: str
-    children_names: List[str]
+    children_names: List[str] = []
+    children: List[ChildSignup] = []
 
 
 class ParentLogin(BaseModel):

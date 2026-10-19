@@ -11,7 +11,7 @@ import io
 import csv
 import math
 from datetime import datetime, date
-from typing import List
+from typing import List, Optional
 
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -69,11 +69,20 @@ def seed_defaults():
         db.add(models.ResultLock(id=1, locked=True))
     if not db.query(models.Geofence).first():
         db.add(models.Geofence(id=1, latitude=7.4341, longitude=3.9357, radius_m=200))
+    if not db.query(models.ClassLevel).first():
+        names = (["Nursery %d" % i for i in range(1, 4)] + ["Primary %d" % i for i in range(1, 7)]
+                 + ["JSS %d" % i for i in range(1, 4)] + ["SS %d" % i for i in range(1, 4)])
+        db.add_all([models.ClassLevel(name=n, position=i + 1, fee=0) for i, n in enumerate(names)])
+    if not db.query(models.ProgrammeFee).first():
+        db.add_all([
+            models.ProgrammeFee(id=1, name="Crèche", age_text="From 3 months", fee=35000),
+            models.ProgrammeFee(id=2, name="Nursery School", age_text="From age 2", fee=40000),
+            models.ProgrammeFee(id=3, name="Primary School", age_text="From age 5", fee=45000),
+            models.ProgrammeFee(id=4, name="Junior Secondary", age_text="From age 10", fee=55000),
+            models.ProgrammeFee(id=5, name="Senior Secondary", age_text="From age 13", fee=65000),
+        ])
     db.commit()
-    total = _fee_total(db)
-    if total != 67000:
-        db.query(models.Student).filter(models.Student.fees_due == 67000).update({models.Student.fees_due: total})
-        db.commit()
+    _sync_fees(db)
     if first_run and os.environ.get("SEED_DEMO", "").lower() == "true":
         db.add_all([
             models.Teacher(teacher_code="T001", name="Mrs. Adaeze Okafor", subject="Mathematics", pin="2847"),
@@ -83,9 +92,9 @@ def seed_defaults():
         db.commit()
         t1 = db.query(models.Teacher).first()
         db.add_all([
-            models.Student(student_code="S001", name="Chukwuemeka Obi", class_name="JSS 2A", fees_due=67000,
+            models.Student(student_code="S001", name="Chukwuemeka Obi", class_name="JSS 2", fees_due=0,
                            fees_paid=45000, result_access="pending", teacher_id=t1.id),
-            models.Student(student_code="S002", name="Amina Yusuf", class_name="JSS 2A", fees_due=67000,
+            models.Student(student_code="S002", name="Amina Yusuf", class_name="JSS 2", fees_due=0,
                            fees_paid=67000, result_access="approved", teacher_id=t1.id),
         ])
         db.commit()
@@ -203,7 +212,7 @@ def teacher_profile(teacher_id: int, db: Session = Depends(get_db)):
     teacher = db.query(models.Teacher).filter(models.Teacher.id == teacher_id).first()
     if not teacher:
         raise HTTPException(status_code=404, detail="Teacher not found")
-    students = db.query(models.Student).filter(models.Student.teacher_id == teacher_id).all()
+    students = _teacher_students(db, teacher)
     return {
         "teacher": schemas.TeacherOut.from_orm(teacher),
         "students": [schemas.StudentOut.from_orm(s) for s in students],
@@ -229,15 +238,51 @@ def export_teachers_csv(db: Session = Depends(get_db)):
 # =========================================================
 # FINANCE
 # =========================================================
-def _fee_total(db: Session) -> float:
-    items = db.query(models.FeeItem).all()
-    return float(sum(f.amount for f in items)) if items else 67000.0
+def _norm(x) -> str:
+    return re.sub(r"\s+", " ", (x or "")).strip().lower()
+
+
+def _clean_text(x: str, n: int = 60) -> str:
+    return re.sub(r'[<>"\'`&\\]', "", x or "").strip()[:n]
+
+
+def _class_row(db: Session, name):
+    n = _norm(name)
+    if not n:
+        return None
+    for c in db.query(models.ClassLevel).all():
+        if _norm(c.name) == n:
+            return c
+    return None
+
+
+def _require_class(db: Session, name) -> "models.ClassLevel":
+    c = _class_row(db, name)
+    if not c:
+        raise HTTPException(status_code=400, detail="Please choose a class from the list")
+    return c
+
+
+def _fee_total(db: Session, class_name=None) -> float:
+    """Common fees (charged to everyone) + the fee for this student's class."""
+    common = float(sum(f.amount for f in db.query(models.FeeItem).all()))
+    c = _class_row(db, class_name) if class_name else None
+    return common + (float(c.fee) if c else 0.0)
 
 
 def _sync_fees(db: Session):
-    """Keep every student's total fees equal to the school's fee list."""
-    db.query(models.Student).update({models.Student.fees_due: _fee_total(db)})
+    """Recalculate every student's total from the fee list and their class."""
+    common = float(sum(f.amount for f in db.query(models.FeeItem).all()))
+    fees = {_norm(c.name): float(c.fee or 0) for c in db.query(models.ClassLevel).all()}
+    for st in db.query(models.Student).all():
+        st.fees_due = common + fees.get(_norm(st.class_name), 0.0)
     db.commit()
+
+
+def _teacher_students(db: Session, teacher):
+    cn = _norm(teacher.class_name)
+    return [s for s in db.query(models.Student).all()
+            if s.teacher_id == teacher.id or (cn and _norm(s.class_name) == cn)]
 
 
 @app.get("/api/admin/fees", response_model=List[schemas.FeeItemOut], dependencies=[Depends(auth.require_admin)])
@@ -381,12 +426,13 @@ def list_students(db: Session = Depends(get_db)):
 
 @app.post("/api/admin/students", response_model=schemas.StudentOut, dependencies=[Depends(auth.require_admin)])
 def add_student(payload: schemas.StudentCreate, db: Session = Depends(get_db)):
+    cls = _require_class(db, payload.class_name)
     code = f"S{_next_code_number(db, models.Student.student_code, 'S'):03d}"
     student = models.Student(
         student_code=code,
-        name=payload.name,
-        class_name=payload.class_name or "JSS 2A",
-        fees_due=payload.fees_due if payload.fees_due is not None else _fee_total(db),
+        name=_clean_text(payload.name, 80),
+        class_name=cls.name,
+        fees_due=_fee_total(db, cls.name),
         fees_paid=0,
         result_access="pending",
     )
@@ -402,11 +448,10 @@ def edit_student(student_id: int, payload: schemas.StudentEdit, db: Session = De
     if not student:
         raise HTTPException(status_code=404, detail="Student not found")
     if payload.name is not None:
-        student.name = payload.name
+        student.name = _clean_text(payload.name, 80) or student.name
     if payload.class_name is not None:
-        student.class_name = payload.class_name
-    if payload.fees_due is not None:
-        student.fees_due = payload.fees_due
+        student.class_name = _require_class(db, payload.class_name).name
+    student.fees_due = _fee_total(db, student.class_name)
     db.commit()
     db.refresh(student)
     return student
@@ -475,7 +520,7 @@ def set_teacher_class(teacher_id: int, payload: schemas.TeacherClassUpdate, db: 
     teacher = db.query(models.Teacher).filter(models.Teacher.id == teacher_id).first()
     if not teacher:
         raise HTTPException(status_code=404, detail="Teacher not found")
-    teacher.class_name = payload.class_name
+    teacher.class_name = _require_class(db, payload.class_name).name
     db.commit()
     return {"class_name": teacher.class_name}
 
@@ -539,7 +584,10 @@ def teacher_checkin(teacher_id: int, payload: schemas.CheckInRequest, db: Sessio
 
 @app.get("/api/teacher/{teacher_id}/students", response_model=List[schemas.StudentOut], dependencies=[Depends(auth.require_teacher)])
 def teacher_students(teacher_id: int, db: Session = Depends(get_db)):
-    return db.query(models.Student).filter(models.Student.teacher_id == teacher_id).all()
+    teacher = db.query(models.Teacher).filter(models.Teacher.id == teacher_id).first()
+    if not teacher:
+        raise HTTPException(status_code=404, detail="Teacher not found")
+    return _teacher_students(db, teacher)
 
 
 @app.post("/api/teacher/{teacher_id}/students", response_model=schemas.StudentOut, dependencies=[Depends(auth.require_teacher)])
@@ -547,12 +595,13 @@ def teacher_register_student(teacher_id: int, payload: schemas.StudentCreate, db
     teacher = db.query(models.Teacher).filter(models.Teacher.id == teacher_id).first()
     if not teacher:
         raise HTTPException(status_code=404, detail="Teacher not found")
+    cls = _require_class(db, payload.class_name or teacher.class_name)
     code = f"S{_next_code_number(db, models.Student.student_code, 'S'):03d}"
     student = models.Student(
         student_code=code,
-        name=payload.name,
-        class_name=payload.class_name or "JSS 2A",
-        fees_due=payload.fees_due if payload.fees_due is not None else _fee_total(db),
+        name=_clean_text(payload.name, 80),
+        class_name=cls.name,
+        fees_due=_fee_total(db, cls.name),
         fees_paid=0,
         result_access="pending",
         teacher_id=teacher_id,
@@ -565,8 +614,9 @@ def teacher_register_student(teacher_id: int, payload: schemas.StudentCreate, db
 
 @app.post("/api/teacher/{teacher_id}/students/{student_id}/attendance", dependencies=[Depends(auth.require_teacher)])
 def mark_student_attendance(teacher_id: int, student_id: int, payload: schemas.AttendanceMark, db: Session = Depends(get_db)):
-    student = db.query(models.Student).filter(models.Student.id == student_id, models.Student.teacher_id == teacher_id).first()
-    if not student:
+    teacher = db.query(models.Teacher).filter(models.Teacher.id == teacher_id).first()
+    student = db.query(models.Student).filter(models.Student.id == student_id).first()
+    if not teacher or not student or student not in _teacher_students(db, teacher):
         raise HTTPException(status_code=404, detail="Student not found in this teacher's class")
     today = date.today().isoformat()
     record = db.query(models.Attendance).filter(models.Attendance.student_id == student_id, models.Attendance.date == today).first()
@@ -662,22 +712,34 @@ def parent_signup(payload: schemas.ParentSignup, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(parent)
 
+    wanted = []
+    for ch in payload.children:
+        wanted.append((_clean_text(ch.name, 80), ch.class_name))
+    for nm in payload.children_names:
+        wanted.append((_clean_text(nm, 80), None))
     linked = []
     next_num = _next_code_number(db, models.Student.student_code, 'S') - 1
-    for name in payload.children_names:
-        name = re.sub(r'[<>"\'`&\\]', '', name).strip()[:80]
+    for name, class_name in wanted:
         if not name:
             continue
-        # If a student with this exact name already exists and has no parent yet, link them.
-        existing_student = db.query(models.Student).filter(models.Student.name == name, models.Student.parent_id.is_(None)).first()
+        # If the school already registered this child (same name, no parent yet), link that record.
+        existing_student = next((st for st in db.query(models.Student).filter(models.Student.parent_id.is_(None)).all()
+                                 if _norm(st.name) == _norm(name)), None)
         if existing_student:
             existing_student.parent_id = parent.id
+            existing_student.fees_due = _fee_total(db, existing_student.class_name)
             linked.append(existing_student)
         else:
+            cls = _class_row(db, class_name)
+            if not cls:
+                db.rollback()  # undo any links made so far, then remove the half-made account
+                db.delete(parent)
+                db.commit()
+                raise HTTPException(status_code=400, detail="Please choose the class for %s" % name)
             next_num += 1
             new_student = models.Student(
-                student_code=f"S{next_num:03d}", name=name, class_name="JSS 2A",
-                fees_due=_fee_total(db), fees_paid=0, result_access="pending", parent_id=parent.id,
+                student_code=f"S{next_num:03d}", name=name, class_name=cls.name,
+                fees_due=_fee_total(db, cls.name), fees_paid=0, result_access="pending", parent_id=parent.id,
             )
             db.add(new_student)
             linked.append(new_student)
@@ -778,6 +840,20 @@ def parent_fee_structure(db: Session = Depends(get_db)):
     """Same fee structure the admin set — shared across the whole school."""
     items = db.query(models.FeeItem).all()
     return [{"name": f.name, "amount": f.amount} for f in items]
+
+
+@app.get("/api/parent/children/{student_id}/fees", dependencies=[Depends(auth.require_child_access)])
+def child_fee_breakdown(student_id: int, db: Session = Depends(get_db)):
+    """The fees for THIS child: the school's common fees plus the fee for the child's class."""
+    s = db.query(models.Student).filter(models.Student.id == student_id).first()
+    if not s:
+        raise HTTPException(status_code=404, detail="Student not found")
+    out = []
+    c = _class_row(db, s.class_name)
+    if c and c.fee:
+        out.append({"name": "%s fee" % c.name, "amount": c.fee})
+    out += [{"name": f.name, "amount": f.amount} for f in db.query(models.FeeItem).all()]
+    return out
 
 
 @app.get("/api/parent/children/{student_id}/results", dependencies=[Depends(auth.require_child_access)])
@@ -976,4 +1052,106 @@ def admin_inbox_delete(item_id: int, db: Session = Depends(get_db)):
     if r:
         db.delete(r)
         db.commit()
+    return {"success": True}
+
+
+# =========================================================
+# ADMISSION PRICES PER CLASS (public to read, admin to change)
+# =========================================================
+class ProgrammeFeeIn(_BM):
+    fee: float = _F(ge=0, le=100000000)
+
+
+@app.get("/api/public/programmes")
+def public_programmes(db: Session = Depends(get_db)):
+    rows = db.query(models.ProgrammeFee).order_by(models.ProgrammeFee.id).all()
+    return [{"n": r.id, "name": r.name, "from": r.age_text, "fee": r.fee} for r in rows]
+
+
+@app.put("/api/admin/programmes/{stage}", dependencies=[Depends(auth.require_admin)])
+def admin_set_programme_fee(stage: int, payload: ProgrammeFeeIn, db: Session = Depends(get_db)):
+    row = db.query(models.ProgrammeFee).filter(models.ProgrammeFee.id == stage).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Class level not found")
+    row.fee = payload.fee
+    db.commit()
+    return {"n": row.id, "name": row.name, "from": row.age_text, "fee": row.fee}
+
+
+# =========================================================
+# CLASSES (Nursery 1 ... SS 3), each with its own fee
+# =========================================================
+class ClassIn(_BM):
+    name: str = _F(min_length=1, max_length=40)
+    fee: float = _F(default=0, ge=0, le=100000000)
+
+
+class ClassEdit(_BM):
+    name: Optional[str] = _F(default=None, max_length=40)
+    fee: Optional[float] = _F(default=None, ge=0, le=100000000)
+
+
+@app.get("/api/public/classes")
+def public_classes(db: Session = Depends(get_db)):
+    rows = db.query(models.ClassLevel).order_by(models.ClassLevel.position, models.ClassLevel.id).all()
+    return [{"id": r.id, "name": r.name} for r in rows]
+
+
+@app.get("/api/admin/classes", dependencies=[Depends(auth.require_admin)])
+def admin_classes(db: Session = Depends(get_db)):
+    rows = db.query(models.ClassLevel).order_by(models.ClassLevel.position, models.ClassLevel.id).all()
+    students = db.query(models.Student).all()
+    return [{"id": r.id, "name": r.name, "fee": r.fee,
+             "students": sum(1 for st in students if _norm(st.class_name) == _norm(r.name))} for r in rows]
+
+
+@app.post("/api/admin/classes", dependencies=[Depends(auth.require_admin)])
+def admin_add_class(payload: ClassIn, db: Session = Depends(get_db)):
+    name = _clean_text(payload.name, 40)
+    if not name:
+        raise HTTPException(status_code=400, detail="Enter a class name")
+    if _class_row(db, name):
+        raise HTTPException(status_code=400, detail="That class already exists")
+    pos = (db.query(models.ClassLevel).count() or 0) + 1
+    row = models.ClassLevel(name=name, position=pos, fee=payload.fee)
+    db.add(row)
+    db.commit()
+    return {"id": row.id, "name": row.name, "fee": row.fee, "students": 0}
+
+
+@app.put("/api/admin/classes/{class_id}", dependencies=[Depends(auth.require_admin)])
+def admin_edit_class(class_id: int, payload: ClassEdit, db: Session = Depends(get_db)):
+    row = db.query(models.ClassLevel).filter(models.ClassLevel.id == class_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Class not found")
+    if payload.name is not None:
+        new = _clean_text(payload.name, 40)
+        other = _class_row(db, new)
+        if not new or (other and other.id != row.id):
+            raise HTTPException(status_code=400, detail="Choose a different class name")
+        old = row.name
+        row.name = new
+        for st in db.query(models.Student).all():
+            if _norm(st.class_name) == _norm(old):
+                st.class_name = new
+        for t in db.query(models.Teacher).all():
+            if _norm(t.class_name) == _norm(old):
+                t.class_name = new
+    if payload.fee is not None:
+        row.fee = payload.fee
+    db.commit()
+    _sync_fees(db)
+    return {"id": row.id, "name": row.name, "fee": row.fee}
+
+
+@app.delete("/api/admin/classes/{class_id}", dependencies=[Depends(auth.require_admin)])
+def admin_delete_class(class_id: int, db: Session = Depends(get_db)):
+    row = db.query(models.ClassLevel).filter(models.ClassLevel.id == class_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Class not found")
+    n = sum(1 for st in db.query(models.Student).all() if _norm(st.class_name) == _norm(row.name))
+    if n:
+        raise HTTPException(status_code=400, detail="%d student(s) are in this class. Move them to another class first." % n)
+    db.delete(row)
+    db.commit()
     return {"success": True}

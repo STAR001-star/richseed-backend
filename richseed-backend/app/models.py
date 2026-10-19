@@ -140,3 +140,21 @@ class Inquiry(Base):
     message = Column(String, default="")
     extra = Column(String, default="")  # application: child's name
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ProgrammeFee(Base):
+    """The class levels and per-term prices shown on the Admission page."""
+    __tablename__ = "programme_fees"
+    id = Column(Integer, primary_key=True)  # stage number 1..5
+    name = Column(String, nullable=False)
+    age_text = Column(String, default="")
+    fee = Column(Float, default=0)
+
+
+class ClassLevel(Base):
+    """A class in the school (Nursery 1, Primary 3, JSS 2, SS 1 ...) with its own fee per term."""
+    __tablename__ = "class_levels"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, nullable=False)
+    position = Column(Integer, default=0)
+    fee = Column(Float, default=0)
